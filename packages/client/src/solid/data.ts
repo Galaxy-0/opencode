@@ -207,8 +207,9 @@ function createSync() {
   // `started` is false while a reload waits for the load it replaces. Invalidations that land in
   // that window are already covered, since the reload has not read anything yet.
   type Pending = { promise: Promise<void>; invalidated: boolean; started: boolean }
-  const state = new Map<string, true | Pending>()
-  const start = (key: string, load: () => Promise<void>, wait?: Promise<void>) => {
+  // Retained catalog activity stays subscribed like cached data, but never counts as a fresh read.
+  const state = new Map<string, boolean | Pending>()
+  const start = (key: string, load: () => Promise<void>, wait?: Promise<void>, retainFailure = false) => {
     const entry: Pending = { promise: Promise.resolve(), invalidated: false, started: !wait }
     state.set(key, entry)
     const run = () => {
@@ -220,17 +221,19 @@ function createSync() {
         if (state.get(key) === entry && !entry.invalidated) state.set(key, true)
       })
       .finally(() => {
-        if (state.get(key) === entry) state.delete(key)
+        if (state.get(key) !== entry) return
+        if (retainFailure) state.set(key, false)
+        else state.delete(key)
       })
     return entry.promise
   }
   return {
-    run(key: string, load: () => Promise<void>) {
+    run(key: string, load: () => Promise<void>, retainFailure = false) {
       const active = state.get(key)
       if (active === true) return Promise.resolve()
-      if (!active) return start(key, load)
+      if (!active) return start(key, load, undefined, retainFailure)
       if (!active.invalidated) return active.promise
-      return start(key, load, active.promise)
+      return start(key, load, active.promise, retainFailure)
     },
     complete(key: string) {
       if (state.has(key)) return
@@ -241,18 +244,18 @@ function createSync() {
     },
     pending(key: string) {
       const active = state.get(key)
-      return active !== undefined && active !== true
+      return typeof active === "object"
     },
     invalidate(key?: string) {
       if (key) {
         const active = state.get(key)
         if (active === true) state.delete(key)
-        if (active !== undefined && active !== true && active.started) active.invalidated = true
+        if (typeof active === "object" && active.started) active.invalidated = true
         return
       }
       state.forEach((active, current) => {
         if (active === true) state.delete(current)
-        if (active !== true && active.started) active.invalidated = true
+        if (typeof active === "object" && active.started) active.invalidated = true
       })
     },
   }
@@ -1463,7 +1466,7 @@ export function createData(config: CreateDataInput) {
   function locationResource<Field extends keyof LocationData>(
     field: Field,
     load: (location: ReturnType<typeof locationQuery>) => Promise<{ location: LocationRef; data: LocationData[Field] }>,
-    options?: { alias?: boolean },
+    options?: { alias?: boolean; retainFailure?: boolean },
   ) {
     const publish = (key: string, value: LocationData[Field]) => setStore("location", key, { [field]: value })
     return {
@@ -1471,12 +1474,16 @@ export function createData(config: CreateDataInput) {
       sync: (ref?: LocationRef) => {
         const location = ref ?? defaultLocation()
         const id = locationKey(location)
-        return sync.run(`location.${field}:${id}`, async () => {
-          const response = await load(locationQuery(location))
-          const key = locationKey(response.location)
-          publish(key, response.data)
-          if (options?.alias && key !== id) publish(id, response.data)
-        })
+        return sync.run(
+          `location.${field}:${id}`,
+          async () => {
+            const response = await load(locationQuery(location))
+            const key = locationKey(response.location)
+            publish(key, response.data)
+            if (options?.alias && key !== id) publish(id, response.data)
+          },
+          options?.retainFailure,
+        )
       },
       invalidate: (ref?: LocationRef) => sync.invalidate(`location.${field}:${locationKey(ref ?? defaultLocation())}`),
     }
@@ -2122,8 +2129,14 @@ export function createData(config: CreateDataInput) {
           return { location: response.location, data: response.data.resources }
         }),
       },
-      model: locationResource("model", (location) => api().model.list({ location }), { alias: true }),
-      provider: locationResource("provider", (location) => api().provider.list({ location }), { alias: true }),
+      model: locationResource("model", (location) => api().model.list({ location }), {
+        alias: true,
+        retainFailure: true,
+      }),
+      provider: locationResource("provider", (location) => api().provider.list({ location }), {
+        alias: true,
+        retainFailure: true,
+      }),
       reference: locationResource("reference", (location) => api().reference.list({ location })),
       websearch: {
         list(location?: LocationRef) {

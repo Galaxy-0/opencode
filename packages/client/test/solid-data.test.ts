@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { getEventListeners } from "node:events"
-import { createRoot } from "solid-js"
+import { createRoot, createSignal } from "solid-js"
 import { createData, type CreateDataInput } from "../src/solid"
 import { OpenCode, type ModelInfo, type OpenCodeEvent, type Project, type SessionInfo } from "../src/promise"
 
@@ -939,24 +939,54 @@ test("ignores catalog updates for unloaded locations while refreshing loaded loc
   }
 })
 
-test("revalidates model discovery when an update overtakes an in-flight model list", async () => {
-  const started = Promise.withResolvers<void>()
-  const release = Promise.withResolvers<void>()
+test.each([
+  ["model", "event"],
+  ["provider", "event"],
+  ["model", "canonical"],
+  ["provider", "canonical"],
+  ["model", "resolved"],
+  ["provider", "resolved"],
+  ["model", "cached"],
+  ["provider", "cached"],
+  ["model", "invalidate"],
+  ["provider", "invalidate"],
+  ["model", "disconnect"],
+  ["provider", "disconnect"],
+  ["model", "dispose"],
+  ["provider", "dispose"],
+] as const)("revalidates %s after initial failure (%s)", async (field, mode) => {
+  const [status, setStatus] = createSignal<"connected" | "disconnected">("connected")
   const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
   let requests = 0
+  const paths: string[] = []
   const api = OpenCode.make({
     baseUrl: "http://opencode.local",
     fetch: async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init)
-      if (new URL(request.url).pathname !== "/api/model") throw new Error(`Unexpected request: ${request.url}`)
-      const initial = ++requests === 1
-      if (initial) {
-        started.resolve()
-        await release.promise
-      }
+      const url = new URL(request.url)
+      paths.push(url.pathname)
+      if (mode === "resolved" && url.pathname === "/api/location") return Response.json({ directory: "/canonical" })
+      if (url.pathname !== `/api/${field}`) throw new Error(`Unexpected request: ${request.url}`)
+      expect(url.searchParams.get("location[directory]")).toBe(mode === "resolved" ? "/canonical" : "/project")
+      requests++
+      if (!(mode === "cached" && requests === 1) && requests <= (mode === "cached" ? 4 : 3))
+        return Response.json(
+          { _tag: "ServiceUnavailableError", service: field, message: "Provider is still starting" },
+          { status: 503 },
+        )
       return Response.json({
-        location: { directory: "/project" },
-        data: [modelInfo(initial ? "Before discovery" : "Discovered model")],
+        location: { directory: mode === "canonical" || mode === "resolved" ? "/canonical" : "/project" },
+        data:
+          field === "model"
+            ? [modelInfo(requests === 1 ? "Before recovery" : "Discovered model")]
+            : [
+                {
+                  id: "company",
+                  name: requests === 1 ? "Before recovery" : "Discovered model",
+                  activation: "enabled",
+                  package: "aisdk:@ai-sdk/openai",
+                },
+              ],
       })
     },
   })
@@ -971,31 +1001,136 @@ test("revalidates model discovery when an update overtakes an in-flight model li
           return () => listeners.delete(handler)
         },
       },
-      connection: { status: () => "connected" },
+      connection: { status },
     }),
     dispose,
   }))
 
   try {
-    const initial = setup.data.location.model.sync()
-    await started.promise
+    if (mode === "resolved") await setup.data.location.syncInfo()
+    const offset = mode === "cached" ? 1 : 0
+    if (mode === "cached") {
+      await setup.data.location[field].sync()
+      setup.data.location[field].invalidate()
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await expect(setup.data.location[field].sync()).rejects.toMatchObject({
+        _tag: "ServiceUnavailableError",
+        service: field,
+        message: "Provider is still starting",
+      })
+      expect(requests).toBe(attempt + offset)
+    }
+    if (mode === "cached") expect(setup.data.location[field].list()?.[0]?.name).toBe("Before recovery")
+    else expect(setup.data.location[field].list()).toBeUndefined()
     const event: OpenCodeEvent = {
-      id: "evt_models_discovered",
+      id: "evt_models_recovered",
       created: 1,
-      type: "model.updated",
-      location: { directory: "/project" },
+      type: field === "model" ? "model.updated" : "provider.updated",
+      location: setup.data.location.default(),
       data: {},
     }
+    const reads = paths.length
+    for (const type of ["agent.updated", "skill.updated"] as const) {
+      const unrelated = { ...event, type }
+      listeners.forEach((listener) => listener({ name: type, details: unrelated }))
+    }
+    expect(paths).toHaveLength(reads)
+    const other = { ...event, location: { directory: "/other" } }
+    listeners.forEach((listener) => listener({ name: other.type, details: other }))
+    expect(requests).toBe(3 + offset)
+    if (mode === "invalidate") setup.data.location[field].invalidate()
+    if (mode === "disconnect") {
+      setStatus("disconnected")
+      listeners.forEach((listener) => listener({ name: event.type, details: event }))
+      expect(requests).toBe(3 + offset)
+      setStatus("connected")
+    }
+    if (mode === "dispose") {
+      setup.dispose()
+      expect(listeners.size).toBe(0)
+      listeners.forEach((listener) => listener({ name: event.type, details: event }))
+      expect(requests).toBe(3 + offset)
+      return
+    }
     listeners.forEach((listener) => listener({ name: event.type, details: event }))
-    release.resolve()
-    await initial
-    await wait(() => setup.data.location.model.list()?.[0]?.name === "Discovered model")
-    expect(requests).toBe(2)
+    await wait(() => setup.data.location[field].list()?.[0]?.name === "Discovered model")
+    expect(requests).toBe(4 + offset)
+    if (mode === "canonical") {
+      expect(setup.data.location[field].list({ directory: "/project" })?.[0]?.name).toBe("Discovered model")
+      expect(setup.data.location[field].list({ directory: "/canonical" })?.[0]?.name).toBe("Discovered model")
+    }
   } finally {
-    release.resolve()
     setup.dispose()
   }
 })
+
+test.each(["success", "failure"])(
+  "revalidates model discovery when an update overtakes an in-flight model list (%s)",
+  async (mode) => {
+    const started = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+    let requests = 0
+    const api = OpenCode.make({
+      baseUrl: "http://opencode.local",
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+        if (new URL(request.url).pathname !== "/api/model") throw new Error(`Unexpected request: ${request.url}`)
+        const initial = ++requests === 1
+        if (initial) {
+          started.resolve()
+          await release.promise
+          if (mode === "failure")
+            return Response.json(
+              { _tag: "ServiceUnavailableError", service: "model", message: "Starting" },
+              { status: 503 },
+            )
+        }
+        return Response.json({
+          location: { directory: "/project" },
+          data: [modelInfo(initial ? "Before discovery" : "Discovered model")],
+        })
+      },
+    })
+    const setup = createRoot((dispose) => ({
+      data: createData({
+        api: () => api,
+        directory: "/project",
+        event: {
+          on: () => () => {},
+          listen(handler) {
+            listeners.add(handler)
+            return () => listeners.delete(handler)
+          },
+        },
+        connection: { status: () => "connected" },
+      }),
+      dispose,
+    }))
+
+    try {
+      const initial = setup.data.location.model.sync()
+      await started.promise
+      const event: OpenCodeEvent = {
+        id: "evt_models_discovered",
+        created: 1,
+        type: "model.updated",
+        location: { directory: "/project" },
+        data: {},
+      }
+      listeners.forEach((listener) => listener({ name: event.type, details: event }))
+      release.resolve()
+      if (mode === "failure") await expect(initial).rejects.toMatchObject({ _tag: "ServiceUnavailableError" })
+      else await initial
+      await wait(() => setup.data.location.model.list()?.[0]?.name === "Discovered model")
+      expect(requests).toBe(2)
+    } finally {
+      release.resolve()
+      setup.dispose()
+    }
+  },
+)
 
 test("refreshes references for the location an update names", async () => {
   const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
